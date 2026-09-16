@@ -1,23 +1,46 @@
 name: manifold edition
 
-# The Superlearn editorial pass: Tuesday and Friday at 07:00 America/Toronto.
-# GitHub Actions cron is UTC, so both DST candidates are scheduled and a guard
-# lets only the one that is 07:00 in Toronto proceed (0 11 UTC = 07:00 EDT in
-# summer, 0 12 UTC = 07:00 EST in winter). Equivalent to the Mission Control
-# scheduler trigger manifold_edition (docs/adr/0001-manifold-runtime.md).
+# The Superlearn editorial pass: a fresh edition every Tuesday and Friday at
+# 07:00 America/Toronto. Equivalent to the Mission Control scheduler trigger
+# manifold_edition (docs/adr/0001-manifold-runtime.md).
+#
+# Why this fires many times, not once: GitHub Actions cron is best-effort. It
+# delays scheduled runs (often by hours) and occasionally drops them, so a
+# single trigger at the target hour is unreliable. The earlier design pinned a
+# bash guard to exactly 07:00 Toronto, so every delayed run (which is nearly
+# all of them) was silently skipped while the job still reported "success", and
+# the app's main edition went weeks stale. Instead we fire several times across
+# the day and let manifold's date-based staleness gate decide: it produces an
+# edition only when the current Tue/Fri slot still owes one, so the first
+# firing after the slot opens writes it, later firings that day skip, and a
+# delayed or dropped firing is caught by the next one or by the two Wed/Sat
+# catch-up firings. The gate is idempotent and DST-correct in TypeScript,
+# unit-tested in manifold/tests/schedule.test.ts (manifold/src/schedule.ts).
+# The concurrency group below serializes overlapping firings, so the self-gated
+# scheduled path never races to write two editions for one slot; a manual
+# --force run can still deliberately regenerate a slot's edition (by design).
+#
+# Cron is UTC; the gate itself handles the timezone, so these hours only need
+# to straddle the Toronto day in both DST regimes (minute :23 avoids the top of
+# the hour, GitHub's most congested and most-dropped cron minute, so a slot's
+# firings do not all fail together):
+#   :23 11 UTC = 07:23 EDT / 06:23 EST    :23 15 UTC = 11:23 EDT / 10:23 EST
+#   :23 19 UTC = 15:23 EDT / 14:23 EST    (a pre-07:00 firing simply finds the
+#   slot not yet open and exits.)
 #
 # Disable switch (any one of these pauses it):
 #   1. Set the repository variable MANIFOLD_EDITION_ENABLED to "false"
 #      (Settings > Secrets and variables > Actions > Variables). This is the
 #      trivial, no-commit pause.
-#   2. Comment out the two `schedule` lines below.
+#   2. Comment out the `schedule` lines below.
 #   3. Disable this workflow in the Actions tab.
-# Manual runs (workflow_dispatch) always proceed, ignoring the hour guard.
+# Manual runs (workflow_dispatch) always produce, bypassing the schedule gate
+# via --force.
 
 on:
   schedule:
-    - cron: '0 11 * * 2,5'   # 07:00 America/Toronto during EDT (summer)
-    - cron: '0 12 * * 2,5'   # 07:00 America/Toronto during EST (winter)
+    - cron: '23 11,15,19 * * 2,5'   # Tue & Fri: three firings spread across the Toronto day
+    - cron: '23 12,17 * * 3,6'      # Wed & Sat: two catch-up firings if every Tue/Fri firing was dropped
   workflow_dispatch: {}
 
 permissions:
@@ -40,46 +63,33 @@ jobs:
           cache: npm
       - run: npm ci
 
-      - id: gate
-        name: only proceed at 07:00 America/Toronto (DST-safe)
-        run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            echo "manual run: proceeding regardless of the hour."
-            echo "proceed=true" >> "$GITHUB_OUTPUT"; exit 0
-          fi
-          HOUR=$(TZ=America/Toronto date +%H)
-          if [ "$HOUR" = "07" ]; then
-            echo "07:xx in America/Toronto: this is the live DST candidate, proceeding."
-            echo "proceed=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "Currently ${HOUR}:xx in America/Toronto, not 07: this is the off-DST candidate, skipping."
-            echo "proceed=false" >> "$GITHUB_OUTPUT"
-          fi
-
       # The editorial pass calls the model through the `claude` CLI transport
-      # (manifold/src/claude.ts): install it on the runner and authenticate it
-      # with a subscription OAuth token, not a metered API key. Generate the
-      # token once with `claude setup-token` (Pro/Max, valid one year) and store
-      # it as the CLAUDE_CODE_OAUTH_TOKEN repository secret. Installed only on
-      # the proceeding DST candidate, so skipped runs stay fast.
+      # (manifold/src/claude.ts), authenticated by a subscription OAuth token
+      # (CLAUDE_CODE_OAUTH_TOKEN), not a metered API key. Generate the token
+      # once with `claude setup-token` (Pro/Max, valid one year) and store it as
+      # the repository secret. Installed on every firing; a firing that the
+      # schedule gate finds nothing owed exits before the model is ever called,
+      # so the install is the only cost of a no-op run.
       - name: install the Claude Code CLI (subscription transport)
-        if: ${{ steps.gate.outputs.proceed == 'true' }}
         run: npm install -g @anthropic-ai/claude-code
 
+      # The command self-gates on the Tue/Fri schedule: it exits 0 without
+      # calling the model when no edition is owed for the current slot, writes a
+      # new edition when one is, and exits 1 on a real failure (transport, gate
+      # rejection, Supabase write). Manual runs pass --force to always produce.
       - name: run the editorial pass
-        if: ${{ steps.gate.outputs.proceed == 'true' }}
         env:
           SUPABASE_URL: ${{ vars.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
           # No ANTHROPIC_API_KEY: an unset key makes makeClaude fall back to the
-          # `claude` CLI, which this token authenticates. Setting an API key here
-          # would silently switch the pass onto metered API billing instead.
+          # `claude` CLI, which the OAuth token authenticates. Setting an API key
+          # here would silently switch the pass onto metered API billing.
           CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           MANIFOLD_MODEL: ${{ vars.MANIFOLD_MODEL }}
-        run: npm run manifold:edition
+        run: npm run manifold:edition ${{ github.event_name == 'workflow_dispatch' && '-- --force' || '' }}
 
       - name: upload run report
-        if: ${{ always() && steps.gate.outputs.proceed == 'true' }}
+        if: ${{ always() }}
         uses: actions/upload-artifact@v4
         with:
           name: manifold-edition-report-${{ github.run_id }}

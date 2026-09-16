@@ -1,18 +1,27 @@
 // manifold CLI. Three commands, all runnable by the operator by hand and by
 // the scheduled GitHub Actions workflows:
-//   tsx manifold/src/cli.ts edition [--dry-run] [--model <id>] [--max-attempts N]
+//   tsx manifold/src/cli.ts edition [--dry-run] [--force] [--check] [--model <id>] [--max-attempts N]
 //   tsx manifold/src/cli.ts outbox  [--dry-run]
 //   tsx manifold/src/cli.ts ingest  [--dry-run]
-// (or the npm scripts: manifold:edition, manifold:edition:dry, manifold:sweep,
+// edition flags: --force ignores the Tue/Fri schedule gate and always runs the
+// pass (manual runs); --dry-run runs the pass but writes nothing, and likewise
+// bypasses the gate so an off-slot smoke test still exercises the pass; --check
+// reports whether an edition is owed for the current slot and exits without
+// calling the model.
+// (or the npm scripts: manifold:edition, manifold:edition:dry,
+// manifold:edition:force, manifold:edition:check, manifold:sweep,
 // manifold:sweep:dry, manifold:ingest, manifold:ingest:dry). Exit codes: 0
-// success, 1 gate rejection or processing failure, 2 usage or configuration
-// error.
+// success (including --check when an edition is owed, and a scheduled run with
+// nothing owed for the current slot), 1 gate rejection or processing failure
+// (including a --check read failure), 2 usage or configuration error, 10
+// --check when no edition is owed.
 import { mkdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { AGENT_ROOT, loadConfig } from './env.ts';
 import { makeSupabase } from './supabase.ts';
 import { makeClaude } from './claude.ts';
-import { fetchPassInputs, fetchQueuedOutbox, viableItems } from './inputs.ts';
+import { fetchLatestEditionDate, fetchPassInputs, fetchQueuedOutbox, viableItems } from './inputs.ts';
+import { editionDue } from './schedule.ts';
 import { runEditorialPass } from './run.ts';
 import { writePass } from './writer.ts';
 import { writeRunReport } from './report.ts';
@@ -33,14 +42,48 @@ async function editionCommand(args: string[]): Promise<number> {
   if (option(args, '--model')) config.model = option(args, '--model') as string;
   if (option(args, '--max-attempts')) config.maxAttempts = Number(option(args, '--max-attempts'));
   const dryRun = flag(args, '--dry-run');
+  const force = flag(args, '--force');
+  const checkOnly = flag(args, '--check');
 
   const sb = makeSupabase(config);
-  const claude = makeClaude(config.model, config.anthropicApiKey);
   if (config.anonFallback) {
     console.warn(
       'manifold: running on the anon key (SUPABASE_SERVICE_ROLE_KEY unset). Works while RLS is allow-all; set the service key for anything real.',
     );
   }
+
+  // Schedule gate. The workflow fires several times per slot (and can be
+  // delayed or dropped by GitHub Actions), so a firing produces an edition
+  // only when the current Tuesday/Friday slot still owes one. This is the
+  // permanent fix for the stale main page: it is date-based and idempotent, so
+  // a delayed or repeated firing never produces a duplicate and never silently
+  // skips (manifold/src/schedule.ts). `--check` reports the decision and exits
+  // without touching the model (exit 0 due, 10 not due). `--force` (manual
+  // runs) and `--dry-run` (off-slot smoke tests) bypass the gate so they always
+  // run the pass; only an unforced, non-dry scheduled run is gated.
+  if (checkOnly || (!force && !dryRun)) {
+    let lastEditionDate: string | null;
+    try {
+      lastEditionDate = await fetchLatestEditionDate(sb);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.error(
+        `manifold: schedule check could not read the latest edition (retryable): ${msg}. Producing nothing; the next firing retries.`,
+      );
+      return 1;
+    }
+    const decision = editionDue(new Date(), lastEditionDate);
+    console.log(`manifold: schedule check — ${decision.reason}.`);
+    if (checkOnly) return decision.due ? 0 : 10;
+    if (!decision.due) {
+      console.log('manifold: no edition owed for the current slot; nothing to do.');
+      return 0;
+    }
+  } else {
+    console.log(`manifold: ${force ? '--force' : '--dry-run'} set, bypassing the schedule gate.`);
+  }
+
+  const claude = makeClaude(config.model, config.anthropicApiKey);
 
   console.log(`manifold: gathering inputs from ${config.supabaseUrl} ...`);
   const inputs = await fetchPassInputs(sb, config);
@@ -220,7 +263,7 @@ try {
   else if (command === 'ingest') code = await ingestCommand(rest);
   else {
     console.error(
-      'usage: tsx manifold/src/cli.ts <edition|outbox|ingest> [--dry-run] [--model <id>] [--max-attempts N]',
+      'usage: tsx manifold/src/cli.ts <edition|outbox|ingest> [--dry-run] [--force] [--check] [--model <id>] [--max-attempts N]',
     );
     code = 2;
   }

@@ -20,7 +20,7 @@ import type {
 } from './app-contract.ts';
 import type { ManifoldConfig } from './env.ts';
 import { parkPayloadItemIds } from './outbox.ts';
-import type { SupabaseClient } from './supabase.ts';
+import { isTableMissing, type SupabaseClient } from './supabase.ts';
 import { loadState, type ManifoldState } from './state.ts';
 
 export interface PassInputs {
@@ -133,6 +133,29 @@ export async function fetchPassInputs(sb: SupabaseClient, config: ManifoldConfig
     editionFloor: config.editionFloor,
     nowIso,
   };
+}
+
+/** The newest edition's date (YYYY-MM-DD, America/Toronto), or null when no
+ *  edition exists. The schedule gate (manifold/src/schedule.ts) reads this to
+ *  decide whether the current slot still owes an edition, without paying for
+ *  the full pass-inputs fetch or a model call, so a not-due firing exits in one
+ *  cheap read.
+ *
+ *  Degrades to null only when the editions table is genuinely missing (first
+ *  run, unmigrated backend). A transient read failure rethrows: treating a
+ *  network blip as "no edition" would report an edition owed and risk a second
+ *  edition for a slot that already has one. `edition_date=not.is.null` guards
+ *  against a stray null sorting first under `desc`. */
+export async function fetchLatestEditionDate(sb: SupabaseClient): Promise<string | null> {
+  try {
+    const rows = await sb.fetch<{ edition_date?: string | null }[]>(
+      '/editions?select=edition_date&edition_date=not.is.null&order=edition_date.desc&limit=1',
+    );
+    return rows[0]?.edition_date ?? null;
+  } catch (err) {
+    if (isTableMissing(err)) return null;
+    throw err;
+  }
 }
 
 export async function fetchQueuedOutbox(sb: SupabaseClient): Promise<OutboxItem[]> {
