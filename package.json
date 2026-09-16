@@ -14,6 +14,8 @@
     "check": "npm run lint && npm run typecheck && npm run test && npm run build",
     "manifold:edition": "tsx manifold/src/cli.ts edition",
     "manifold:edition:dry": "tsx manifold/src/cli.ts edition --dry-run",
+    "manifold:edition:force": "tsx manifold/src/cli.ts edition --force",
+    "manifold:edition:check": "tsx manifold/src/cli.ts edition --check",
     "manifold:sweep": "tsx manifold/src/cli.ts outbox",
     "manifold:sweep:dry": "tsx manifold/src/cli.ts outbox --dry-run",
     "manifold:ingest": "tsx manifold/src/cli.ts ingest",
